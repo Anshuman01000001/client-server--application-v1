@@ -7,9 +7,26 @@ singleton = require("./Singleton");
 
 module.exports = {
   handleClientJoining: function (sock) {
-        //
-        // Enter your code here
-        //
+    sock.on("data", (data) => {
+      console.log("Received request'");
+
+      //parse of the header (first 12 bytes)
+      let version = parseBitPacket(data, 0, 5);
+      let requestType = parseBitPacket(data, 29,3);
+      let mediaType = parseBitPacket(data, 64, 4);
+      let fileNameSize = parseBitPacket(data, 68, 28);
+
+      //extracting file name
+      let fileNameBytes = data.slice(12, 12 + fileNameSize);
+      let fileName = byteToString(fileNameBytes);
+
+      console.log("version: " + version);
+      console.log("request type: " + requestType);
+      console.log("file name: " + fileName);
+
+      //printing the request packet in bits (temp for debugging)
+      console.log("Request packet in bits: " + printPacketBit(data));
+    });
         // you may need to develop some helper functions
         // that are defined outside this export block
   }
