@@ -74,6 +74,31 @@ module.exports = {
 
           console.log("File size: ", fileData.length, "bytes");
           console.log("First 100 bytes: ", fileData.slice(0, 100));
+          
+          // Create MTP response packet
+          let HEADER_SIZE = 12;
+          let responsePacket = Buffer.alloc(HEADER_SIZE + fileData.length);
+
+          // Fill with zeros first
+          responsePacket.fill(0);
+
+          // Build response header
+          storeBitPacket(responsePacket, 11, 0, 5);          // Version
+          storeBitPacket(responsePacket, 1, 5, 3);           // Response Type: 1=Found
+          storeBitPacket(responsePacket, 0, 8, 24);          // Sequence Number: 0
+          storeBitPacket(responsePacket, 0, 32, 32);         // Reserved
+          storeBitPacket(responsePacket, 1, 64, 1);          // L? flag: 1=last packet
+          storeBitPacket(responsePacket, fileData.length, 65, 31); // Payload size
+
+          // Copy file data to packet (starting at byte 12)
+          fileData.copy(responsePacket, HEADER_SIZE);
+
+          console.log('Sending response packet...');
+          console.log('Response header:');
+          printPacketBit(responsePacket.slice(0, HEADER_SIZE));
+
+          // Send response to client
+          sock.write(responsePacket);
         });
       });
     }); // Closes sock.on("data")
@@ -86,6 +111,23 @@ function handleClientLeaving(sock) {
         // you may need to develop some helper functions
         // that are defined outside this export block
   
+}
+
+// Store integer value into the packet bit stream
+function storeBitPacket(packet, value, offset, length) {
+  let lastBitPosition = offset + length - 1;
+  let number = value.toString(2).padStart(length, '0');
+  let j = number.length - 1;
+  for (let i = 0; i < number.length; i++) {
+    let bytePosition = Math.floor(lastBitPosition / 8);
+    let bitPosition = 7 - (lastBitPosition % 8);
+    if (number.charAt(j--) == "0") {
+      packet[bytePosition] &= ~(1 << bitPosition);
+    } else {
+      packet[bytePosition] |= 1 << bitPosition;
+    }
+    lastBitPosition--;
+  }
 }
 
 
