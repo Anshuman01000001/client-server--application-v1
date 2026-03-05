@@ -27,6 +27,26 @@ module.exports = {
       //printing the request packet in bits (temp for debugging)
       console.log("Request packet in bits: " + printPacketBit(data));
 
+      // Check version - must be 11
+      if (version !== 11) {
+        console.log("ERROR: Invalid MTP version. Expected 11, got", version);
+        
+        // Send "Busy" response (type 3)
+        let HEADER_SIZE = 12;
+        let busyPacket = Buffer.alloc(HEADER_SIZE);
+        busyPacket.fill(0);
+        
+        storeBitPacket(busyPacket, 11, 0, 5);      // Version
+        storeBitPacket(busyPacket, 3, 5, 3);       // Response Type: 3=Busy
+        storeBitPacket(busyPacket, 0, 8, 24);      // Sequence Number
+        storeBitPacket(busyPacket, 0, 32, 32);     // Reserved
+        storeBitPacket(busyPacket, 1, 64, 1);      // L? flag
+        storeBitPacket(busyPacket, 0, 65, 31);     // Payload size: 0
+        
+        console.log('Sending "Busy" response (invalid version)');
+        sock.write(busyPacket);
+        return;
+      }
 
       // you may need to develop some helper functions
       // that are defined outside this export block
@@ -59,7 +79,25 @@ module.exports = {
         
         if (!foundFile) {
           console.log('File not found:', fileName);
-          // Send "Not Found" response (we'll do this in the next step)
+          
+          // Send "Not Found" response
+          let HEADER_SIZE = 12;
+          let notFoundPacket = Buffer.alloc(HEADER_SIZE);
+          notFoundPacket.fill(0);
+          
+          // Build "Not Found" response header
+          storeBitPacket(notFoundPacket, 11, 0, 5);      // Version
+          storeBitPacket(notFoundPacket, 2, 5, 3);       // Response Type: 2=Not Found
+          storeBitPacket(notFoundPacket, 0, 8, 24);      // Sequence Number: 0
+          storeBitPacket(notFoundPacket, 0, 32, 32);     // Reserved
+          storeBitPacket(notFoundPacket, 1, 64, 1);      // L? flag: 1=last packet
+          storeBitPacket(notFoundPacket, 0, 65, 31);     // Payload size: 0
+          
+          console.log('Sending "Not Found" response');
+          console.log('Response header:');
+          printPacketBit(notFoundPacket);
+          
+          sock.write(notFoundPacket);
           return;
         }
 
