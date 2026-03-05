@@ -18,7 +18,7 @@ module.exports = {
 
       //extracting file name
       let fileNameBytes = data.slice(12, 12 + fileNameSize);
-      let fileName = byteToString(fileNameBytes);
+      let fileName = bytesToString(fileNameBytes);
 
       console.log("version: " + version);
       console.log("request type: " + requestType);
@@ -26,11 +26,58 @@ module.exports = {
 
       //printing the request packet in bits (temp for debugging)
       console.log("Request packet in bits: " + printPacketBit(data));
-    });
-        // you may need to develop some helper functions
-        // that are defined outside this export block
-  }
 
+
+      // you may need to develop some helper functions
+      // that are defined outside this export block
+
+      let fs = require("fs");
+      let path = require("path");
+
+      //building the full file path now
+      let filePath = path.join(__dirname, "images", fileName);
+      console.log("looking for file: ", filePath);
+      
+      //cheaking if the file exists with various extensions
+      let extensions = ['.gif', '.jpeg', '.jpg', '.png', '.bmp', '.tiff', '.avi', '.mp4', '.mov'];
+      let foundFile = null;
+      
+      fs.readdir(path.join(__dirname, "images"), (err, files) => {
+        if (err) {
+          console.log("Error reading images directory:", err);
+          return;
+        }
+        
+        // Find the file by matching filename without extension
+        for (let file of files) {
+          let nameWithoutExt = file.split('.')[0];
+          if (nameWithoutExt.toLowerCase() === fileName.toLowerCase()) {
+            foundFile = path.join(__dirname, "images", file);
+            break;
+          }
+        }
+        
+        if (!foundFile) {
+          console.log('File not found:', fileName);
+          // Send "Not Found" response (we'll do this in the next step)
+          return;
+        }
+
+        console.log('File found:', foundFile);
+
+        //reading the file
+        fs.readFile(foundFile, (err, fileData) => {
+          if (err) {
+            console.log("error reading file:", err);
+            return;
+          }
+
+          console.log("File size: ", fileData.length, "bytes");
+          console.log("First 100 bytes: ", fileData.slice(0, 100));
+        });
+      });
+    }); // Closes sock.on("data")
+  } // Closes handleClientJoining
 };
 
 function handleClientLeaving(sock) {
