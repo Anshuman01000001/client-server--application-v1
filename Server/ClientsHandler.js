@@ -111,32 +111,46 @@ module.exports = {
           }
 
           console.log("File size: ", fileData.length, "bytes");
-          console.log("First 100 bytes: ", fileData.slice(0, 100));
           
-          // Create MTP response packet
-          let HEADER_SIZE = 12;
-          let responsePacket = Buffer.alloc(HEADER_SIZE + fileData.length);
+          // Multi-packet support: split file into 64KB chunks
+          const CHUNK_SIZE = 65536; // 64KB per packet
+          const HEADER_SIZE = 12;
+          const totalChunks = Math.ceil(fileData.length / CHUNK_SIZE);
+          
+          console.log(`Splitting file into ${totalChunks} packet(s)`);
+          
+          // Send each chunk as a separate MTP response packet
+          for (let sequenceNumber = 0; sequenceNumber < totalChunks; sequenceNumber++) {
+            const chunkStart = sequenceNumber * CHUNK_SIZE;
+            const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileData.length);
+            const chunkData = fileData.slice(chunkStart, chunkEnd);
+            const chunkSize = chunkData.length;
+            
+            // Determine if this is the last packet
+            const isLastPacket = (sequenceNumber === totalChunks - 1) ? 1 : 0;
+            
+            // Create response packet for this chunk
+            let responsePacket = Buffer.alloc(HEADER_SIZE + chunkSize);
+            responsePacket.fill(0);
 
-          // Fill with zeros first
-          responsePacket.fill(0);
+            // Build response header
+            storeBitPacket(responsePacket, 11, 0, 5);              // Version
+            storeBitPacket(responsePacket, 1, 5, 3);               // Response Type: 1=Found
+            storeBitPacket(responsePacket, sequenceNumber, 8, 24); // Sequence Number
+            storeBitPacket(responsePacket, 0, 32, 32);             // Reserved
+            storeBitPacket(responsePacket, isLastPacket, 64, 1);   // L? flag: 1 for last packet
+            storeBitPacket(responsePacket, chunkSize, 65, 31);     // Payload size
 
-          // Build response header
-          storeBitPacket(responsePacket, 11, 0, 5);          // Version
-          storeBitPacket(responsePacket, 1, 5, 3);           // Response Type: 1=Found
-          storeBitPacket(responsePacket, 0, 8, 24);          // Sequence Number: 0
-          storeBitPacket(responsePacket, 0, 32, 32);         // Reserved
-          storeBitPacket(responsePacket, 1, 64, 1);          // L? flag: 1=last packet
-          storeBitPacket(responsePacket, fileData.length, 65, 31); // Payload size
+            // Copy chunk data to packet (starting at byte 12)
+            chunkData.copy(responsePacket, HEADER_SIZE);
 
-          // Copy file data to packet (starting at byte 12)
-          fileData.copy(responsePacket, HEADER_SIZE);
-
-          console.log('Sending response packet...');
-          console.log('Response header:');
-          printPacketBit(responsePacket.slice(0, HEADER_SIZE));
-
-          // Send response to client
-          sock.write(responsePacket);
+            console.log(`Sending packet ${sequenceNumber + 1}/${totalChunks} (${chunkSize} bytes, Last=${isLastPacket})`);
+            
+            // Send response to client
+            sock.write(responsePacket);
+          }
+          
+          console.log('All packets sent');
         });
       });
     }); // Closes sock.on("data")
