@@ -107,6 +107,11 @@ let headerReceived = false;
 let connectionTimeout;
 let transferTimeout;
 
+// Multi-packet support: Track received packets
+let packetMap = {};
+let nextExpectedSeq = 0;
+let fileComplete = false;
+
 // Step 1: Connection timeout (10 seconds)
 connectionTimeout = setTimeout(() => {
   console.log('ERROR: Connection timeout - server did not respond within 10 seconds');
@@ -156,80 +161,130 @@ client.on('data', (data) => {
   // Accumulate received data
   receivedData = Buffer.concat([receivedData, data]);
   
-  // Parse header once we have at least 12 bytes
-  if (!headerReceived && receivedData.length >= 12) {
-    let responseVersion = parseBitPacket(receivedData, 0, 5);
-    let responseType = parseBitPacket(receivedData, 5, 3);
-    let sequenceNumber = parseBitPacket(receivedData, 8, 24);
-    let lastPacketFlag = parseBitPacket(receivedData, 64, 1);
-    expectedPayloadSize = parseBitPacket(receivedData, 65, 31);
+  // Multi-packet support: Process all complete packets in the buffer
+  let processedBytes = 0;
+  
+  // Process packets from the buffer
+  while (receivedData.length - processedBytes >= 12) {
+    const packetStart = processedBytes;
     
-    // Step 4: Validate response header
-    if (responseVersion !== 11) {
-      console.log('ERROR: Invalid MTP version in response. Expected 11, got', responseVersion);
+    // Parse header of current packet
+    const headerBuf = receivedData.slice(packetStart, packetStart + 12);
+    let responseVersion = parseBitPacket(headerBuf, 0, 5);
+    let responseType = parseBitPacket(headerBuf, 5, 3);
+    let sequenceNumber = parseBitPacket(headerBuf, 8, 24);
+    let lastPacketFlag = parseBitPacket(headerBuf, 64, 1);
+    const payloadSize = parseBitPacket(headerBuf, 65, 31);
+    
+    // Check if we have the complete packet (header + payload)
+    if (receivedData.length - packetStart < 12 + payloadSize) {
+      // Don't have complete packet yet, wait for more data
+      break;
+    }
+    
+    // We have a complete packet
+    const payloadStart = packetStart + 12;
+    const payloadEnd = payloadStart + payloadSize;
+    const payload = receivedData.slice(payloadStart, payloadEnd);
+    
+    console.log(`Received packet ${sequenceNumber + 1}: ${payloadSize} bytes (Last=${lastPacketFlag})`);
+    
+    // Validate response on first packet only
+    if (!headerReceived) {
+      // Step 4: Validate response header
+      if (responseVersion !== 11) {
+        console.log('ERROR: Invalid MTP version in response. Expected 11, got', responseVersion);
+        clearTimeout(transferTimeout);
+        client.destroy();
+        return;
+      }
+      
+      if (responseType < 1 || responseType > 3) {
+        console.log('ERROR: Invalid response type. Expected 1-3, got', responseType);
+        clearTimeout(transferTimeout);
+        client.destroy();
+        return;
+      }
+      
+      if (payloadSize < 0) {
+        console.log('ERROR: Invalid payload size in response');
+        clearTimeout(transferTimeout);
+        client.destroy();
+        return;
+      }
+      
+      console.log('Received response from server');
+      console.log('Response Header:');
+      console.log('  Version:', responseVersion);
+      console.log('  Response Type:', responseType, 
+        responseType === 1 ? '(Found)' : 
+        responseType === 2 ? '(Not Found)' : 
+        responseType === 3 ? '(Busy)' : '(Other)');
+      
+      headerReceived = true;
+      
+      // Step 2: Transfer timeout (30 seconds) - starts after first header received
+      transferTimeout = setTimeout(() => {
+        console.log('ERROR: Transfer timeout - file transfer did not complete within 30 seconds');
+        client.destroy();
+      }, 30000);
+      
+      if (responseType === 2) {
+        console.log('File not found on server');
+        clearTimeout(transferTimeout);
+        client.destroy();
+        return;
+      }
+      
+      if (responseType === 3) {
+        console.log('Server is busy or version mismatch');
+        clearTimeout(transferTimeout);
+        client.destroy();
+        return;
+      }
+    }
+    
+    // Validate sequence number for multi-packet support
+    if (sequenceNumber !== nextExpectedSeq) {
+      console.log(`ERROR: Out of order packet. Expected seq ${nextExpectedSeq}, got ${sequenceNumber}`);
       clearTimeout(transferTimeout);
       client.destroy();
       return;
     }
     
-    if (responseType < 1 || responseType > 3) {
-      console.log('ERROR: Invalid response type. Expected 1-3, got', responseType);
-      clearTimeout(transferTimeout);
-      client.destroy();
-      return;
-    }
+    // Store this packet's payload
+    packetMap[sequenceNumber] = payload;
+    nextExpectedSeq++;
     
-    if (expectedPayloadSize < 0) {
-      console.log('ERROR: Invalid payload size in response');
-      clearTimeout(transferTimeout);
-      client.destroy();
-      return;
-    }
+    // Mark position for next iteration
+    processedBytes = payloadEnd;
     
-    console.log('Received response from server');
-    console.log('Response Header:');
-    console.log('  Version:', responseVersion);
-    console.log('  Response Type:', responseType, 
-      responseType === 1 ? '(Found)' : 
-      responseType === 2 ? '(Not Found)' : 
-      responseType === 3 ? '(Busy)' : '(Other)');
-    console.log('  Sequence Number:', sequenceNumber);
-    console.log('  Last Packet:', lastPacketFlag === 1 ? 'Yes' : 'No');
-    console.log('  Expected Payload Size:', expectedPayloadSize, 'bytes');
-    
-    headerReceived = true;
-    
-    // Step 2: Transfer timeout (30 seconds) - starts after header received
-    transferTimeout = setTimeout(() => {
-      console.log('ERROR: Transfer timeout - file transfer did not complete within 30 seconds');
-      client.destroy();
-    }, 30000);
-    
-    if (responseType === 2) {
-      console.log('File not found on server');
-      clearTimeout(transferTimeout);
-      client.destroy();
-      return;
-    }
-    
-    if (responseType === 3) {
-      console.log('Server is busy or version mismatch');
-      clearTimeout(transferTimeout);
-      client.destroy();
-      return;
+    // Check if this is the last packet
+    if (lastPacketFlag === 1) {
+      fileComplete = true;
+      break;
     }
   }
   
-  // Check if we've received the complete packet (header + payload)
-  if (headerReceived && receivedData.length >= 12 + expectedPayloadSize) {
-    console.log('Complete file received! Total bytes:', receivedData.length);
+  // Remove processed packets from buffer
+  if (processedBytes > 0) {
+    receivedData = receivedData.slice(processedBytes);
+  }
+  
+  // If file transfer is complete, reassemble and save
+  if (fileComplete) {
+    console.log('Complete file received! Reassembling...');
     
-    // Clear transfer timeout - file transfer complete
+    // Clear transfer timeout
     clearTimeout(transferTimeout);
     
-    // Extract file data (starts at byte 12)
-    let fileData = receivedData.slice(12, 12 + expectedPayloadSize);
-    console.log('Extracted file data:', fileData.length, 'bytes');
+    // Concatenate all payloads in order
+    let fileData = Buffer.alloc(0);
+    for (let i = 0; i < nextExpectedSeq; i++) {
+      fileData = Buffer.concat([fileData, packetMap[i]]);
+    }
+    
+    console.log('File reassembled:', fileData.length, 'bytes');
     
     // Create media folder if it doesn't exist
     const mediaFolder = 'media';
@@ -263,8 +318,6 @@ client.on('data', (data) => {
         });
       });
     });
-  } else if (headerReceived) {
-    console.log('Received chunk... Total so far:', receivedData.length, 'bytes. Waiting for', (12 + expectedPayloadSize - receivedData.length), 'more bytes');
   }
 });
 
