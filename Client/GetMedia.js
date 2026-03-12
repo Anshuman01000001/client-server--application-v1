@@ -183,9 +183,9 @@ console.log("MTP Version:", version);
 // Map string type to numeric
 let requestTypeNum = 1;
 if (requestType === "secret") requestTypeNum = 2;
-else if (requestType === "reset") requestTypeNum = 3;
-else if (requestType === "ack") requestTypeNum = 4;
-else if (requestType === "complete") requestTypeNum = 5;
+else if (requestType === "ack") requestTypeNum = 3;
+else if (requestType === "complete") requestTypeNum = 4;
+else if (requestType === "reset") requestTypeNum = 5;
 
 // ============================================================
 // Dispatch based on mode
@@ -376,6 +376,26 @@ function runSecretMode() {
   let packetMap = {};
   let nextExpectedSeq = 0;
   let currentFileName = "";
+  let resetIssued = false;
+
+  function sendResetAndClose(reason) {
+    console.log("Secret session failed:", reason);
+
+    if (resetIssued) return;
+    resetIssued = true;
+
+    if (!client.destroyed && client.writable) {
+      let resetPacket = createRequestPacket(version, 5, 0, "reset");
+      console.log("Sending Reset request (type 5)");
+      client.write(resetPacket, () => {
+        clearTimeout(transferTimeout);
+        client.destroy();
+      });
+    } else {
+      clearTimeout(transferTimeout);
+      client.destroy();
+    }
+  }
 
   connectionTimeout = setTimeout(() => {
     console.log("ERROR: Connection timeout");
@@ -387,8 +407,7 @@ function runSecretMode() {
     clearTimeout(connectionTimeout);
 
     transferTimeout = setTimeout(() => {
-      console.log("ERROR: Secret session timeout");
-      client.destroy();
+      sendResetAndClose("Secret session timeout");
     }, 60000);
 
     // Send Secret request (type 2)
@@ -463,14 +482,10 @@ function runSecretMode() {
           console.log("Waiting for key part...");
         }
       } else if (responseType === 2) {
-        console.log("File not found!");
-        clearTimeout(transferTimeout);
-        client.destroy();
+        sendResetAndClose("File not found while completing secret sequence");
         return;
       } else if (responseType === 3) {
-        console.log("Server busy or version mismatch!");
-        clearTimeout(transferTimeout);
-        client.destroy();
+        sendResetAndClose("Server busy or version mismatch during secret session");
         return;
       }
     }
@@ -484,8 +499,8 @@ function runSecretMode() {
     switch (flag) {
       case 1: // Riddle
         if (state !== "WAIT_RIDDLE") {
-          console.log("Unexpected riddle in state:", state);
-          break;
+          sendResetAndClose("Unexpected riddle in state " + state);
+          return;
         }
         console.log("\n=== RIDDLE ===");
         console.log(payloadStr);
@@ -495,8 +510,7 @@ function runSecretMode() {
         console.log("Detected file sequence:", fileSequence);
 
         if (fileSequence.length !== 3) {
-          console.log("ERROR: Could not determine 3 files from riddle");
-          client.destroy();
+          sendResetAndClose("Could not determine required 3-file sequence from riddle");
           return;
         }
 
@@ -507,8 +521,8 @@ function runSecretMode() {
 
       case 2: // Key Part
         if (state !== "WAIT_KEY_PART") {
-          console.log("Unexpected key part in state:", state);
-          break;
+          sendResetAndClose("Unexpected key part in state " + state);
+          return;
         }
         console.log("Received key part " + keyPartIndex + ": " + payloadStr);
         keyParts[keyPartIndex] = payloadStr;
@@ -516,7 +530,7 @@ function runSecretMode() {
         // Send ACK
         let ackPacket = createRequestPacket(
           version,
-          4,
+          3,
           0,
           String(keyPartIndex)
         );
@@ -527,8 +541,8 @@ function runSecretMode() {
 
       case 3: // Ack Receipt
         if (state !== "WAIT_ACK_RECEIPT") {
-          console.log("Unexpected ack receipt in state:", state);
-          break;
+          sendResetAndClose("Unexpected ACK receipt in state " + state);
+          return;
         }
         console.log("Ack receipt received");
 
@@ -540,11 +554,11 @@ function runSecretMode() {
           // All files done, send Complete
           let completePacket = createRequestPacket(
             version,
-            5,
+            4,
             0,
             "complete"
           );
-          console.log("Sending Complete request (type 5)");
+          console.log("Sending Complete request (type 4)");
           client.write(completePacket);
           state = "WAIT_SECRET";
         }
@@ -552,8 +566,8 @@ function runSecretMode() {
 
       case 4: // Encrypted Secret
         if (state !== "WAIT_SECRET") {
-          console.log("Unexpected secret in state:", state);
-          break;
+          sendResetAndClose("Unexpected encrypted secret in state " + state);
+          return;
         }
         console.log("\n=== ENCRYPTED SECRET ===");
         console.log(payloadStr);
@@ -563,20 +577,39 @@ function runSecretMode() {
         console.log("Reconstructed key:", fullKey);
 
         // Decrypt
-        let decrypted = VigenereCipher.decrypt(payloadStr, fullKey);
+        let decrypted;
+        try {
+          decrypted = VigenereCipher.decrypt(payloadStr, fullKey);
+        } catch (err) {
+          sendResetAndClose("Decryption failed: " + err.message);
+          return;
+        }
+
         console.log("\n=== DECRYPTED SECRET ===");
         console.log(decrypted);
         console.log("========================\n");
 
-        clearTimeout(transferTimeout);
-        client.destroy();
+        let secretFilePath = "media/secret_message.txt";
+        fs.mkdirSync("media", { recursive: true });
+        fs.writeFileSync(secretFilePath, decrypted + "\n", "utf8");
+        console.log("Secret file saved:", secretFilePath);
+
+        open(secretFilePath)
+          .then(() => {
+            console.log("Secret file opened!");
+            clearTimeout(transferTimeout);
+            client.destroy();
+          })
+          .catch((err) => {
+            console.log("Could not auto-open secret file:", err.message);
+            clearTimeout(transferTimeout);
+            client.destroy();
+          });
         break;
 
       case 5: // Error / Expired
-        console.log("Server error:", payloadStr);
-        clearTimeout(transferTimeout);
-        client.destroy();
-        break;
+        sendResetAndClose("Server error: " + payloadStr);
+        return;
     }
   }
 

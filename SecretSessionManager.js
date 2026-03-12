@@ -29,6 +29,7 @@ function startSession(sock) {
     nextFileIndex: 0,
     keyParts: splitKey(variant.key),
     nextKeyPartToSend: 0,
+    awaitingAck: false,
     keyPartsAcknowledged: 0,
     startTime: Date.now()
   };
@@ -67,6 +68,18 @@ function recordFileRequest(sock, fileName) {
   let session = getSession(sock);
   if (!session) return { valid: false, reason: 'no session' };
 
+  if (session.awaitingAck) {
+    return {
+      valid: false,
+      reason: 'ack required',
+      expectedAckPart: session.nextKeyPartToSend
+    };
+  }
+
+  if (session.nextFileIndex >= session.sequence.length) {
+    return { valid: false, reason: 'sequence already complete' };
+  }
+
   let expectedFile = session.sequence[session.nextFileIndex];
   if (fileName.toLowerCase() !== expectedFile.toLowerCase()) {
     return { valid: false, reason: 'wrong file order', expected: expectedFile, got: fileName };
@@ -83,27 +96,56 @@ function getNextKeyPart(sock) {
   let session = getSession(sock);
   if (!session) return null;
 
+  if (session.awaitingAck) {
+    return { blocked: true, expectedPartIndex: session.nextKeyPartToSend };
+  }
+
   let index = session.nextKeyPartToSend;
   if (index >= session.keyParts.length) return null;
 
   let part = session.keyParts[index];
-  session.nextKeyPartToSend++;
+  session.awaitingAck = true;
+  session.state = States.KEY_DISTRIBUTION;
   return { part: part, index: index };
 }
 
 function acknowledgeKeyPart(sock, partIndex) {
   let session = getSession(sock);
-  if (!session) return false;
+  if (!session) return { valid: false, reason: 'no session' };
 
+  if (!session.awaitingAck) {
+    return { valid: false, reason: 'no key part pending' };
+  }
+
+  let expectedPartIndex = session.nextKeyPartToSend;
+  if (partIndex !== expectedPartIndex) {
+    return {
+      valid: false,
+      reason: 'unexpected key part ack',
+      expectedPartIndex: expectedPartIndex
+    };
+  }
+
+  session.awaitingAck = false;
   session.keyPartsAcknowledged++;
-  return true;
+  session.nextKeyPartToSend++;
+
+  if (session.keyPartsAcknowledged >= session.keyParts.length) {
+    session.state = States.COMPLETE;
+  }
+
+  return { valid: true, partIndex: partIndex };
 }
 
 function isReadyForSecret(sock) {
   let session = getSession(sock);
   if (!session) return false;
 
-  return session.nextFileIndex >= 3 && session.keyPartsAcknowledged >= 3;
+  return (
+    session.nextFileIndex >= session.sequence.length &&
+    session.keyPartsAcknowledged >= session.keyParts.length &&
+    !session.awaitingAck
+  );
 }
 
 function getEncryptedSecret(sock) {

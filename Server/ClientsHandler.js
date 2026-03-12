@@ -2,7 +2,6 @@ var MTPpacket = require("./MTPResponse"),
   singleton = require("./Singleton");
 
 let SecretSessionManager = require("../SecretSessionManager");
-let SecretVariants = require("../SecretVariants");
 let fs = require("fs");
 let path = require("path");
 
@@ -49,14 +48,14 @@ module.exports = {
         case 2: // Secret - start secret session
           handleSecretRequest(sock);
           break;
-        case 3: // Reset
-          handleReset(sock);
-          break;
-        case 4: // ACK
+        case 3: // ACK
           handleAck(sock, fileName);
           break;
-        case 5: // Complete
+        case 4: // Complete
           handleComplete(sock);
+          break;
+        case 5: // Reset
+          handleReset(sock);
           break;
         default:
           console.log("Unknown request type:", requestType);
@@ -72,6 +71,54 @@ module.exports = {
 
 function handleQuery(sock, fileName) {
   let session = SecretSessionManager.getSession(sock);
+  let isSecretQuery = !!session;
+
+  if (isSecretQuery) {
+    if (!SecretSessionManager.isSessionValid(sock)) {
+      console.log("Secret session expired due to time-window rotation");
+      sendSecretMessage(
+        sock,
+        5,
+        "Secret session expired. Send Reset (type 5) and start again.",
+        0
+      );
+      return;
+    }
+
+    let sequenceResult = SecretSessionManager.recordFileRequest(sock, fileName);
+    if (!sequenceResult.valid) {
+      let failureMessage =
+        "Secret sequence failed. Send Reset (type 5) and start again.";
+
+      if (sequenceResult.reason === "ack required") {
+        failureMessage =
+          "ACK required for key part " +
+          sequenceResult.expectedAckPart +
+          " before requesting the next file.";
+      } else if (sequenceResult.reason === "wrong file order") {
+        failureMessage =
+          "Wrong file order. Expected " +
+          sequenceResult.expected +
+          " but got " +
+          sequenceResult.got +
+          ".";
+      } else if (sequenceResult.reason === "sequence already complete") {
+        failureMessage =
+          "File sequence already completed. Send Complete (type 4) or Reset (type 5).";
+      }
+
+      console.log("Secret session failure:", failureMessage);
+      sendSecretMessage(sock, 5, failureMessage, 0);
+      SecretSessionManager.endSession(sock);
+      return;
+    }
+
+    console.log(
+      "Secret session: file",
+      sequenceResult.fileIndex + 1,
+      "of 3 accepted"
+    );
+  }
 
   console.log("Looking for file:", fileName);
 
@@ -92,7 +139,18 @@ function handleQuery(sock, fileName) {
 
     if (!foundFile) {
       console.log("File not found:", fileName);
-      sendNotFoundResponse(sock);
+
+      if (isSecretQuery) {
+        sendSecretMessage(
+          sock,
+          5,
+          "Requested secret sequence file not found. Send Reset (type 5) and start again.",
+          0
+        );
+        SecretSessionManager.endSession(sock);
+      } else {
+        sendNotFoundResponse(sock);
+      }
       return;
     }
 
@@ -108,35 +166,28 @@ function handleQuery(sock, fileName) {
       sendFileData(sock, fileData);
 
       // If in secret session, track file request and send key part
-      if (session && SecretSessionManager.isSessionValid(sock)) {
-        let result = SecretSessionManager.recordFileRequest(sock, fileName);
-        if (result.valid) {
-          console.log(
-            "Secret session: file",
-            result.fileIndex + 1,
-            "of 3 received correctly"
-          );
+      if (isSecretQuery) {
+        let keyPartInfo = SecretSessionManager.getNextKeyPart(sock);
 
-          // Send key part after file data
-          let keyPartInfo = SecretSessionManager.getNextKeyPart(sock);
-          if (keyPartInfo) {
-            console.log(
-              "Sending key part",
-              keyPartInfo.index,
-              ":",
-              keyPartInfo.part
-            );
-            sendSecretMessage(sock, 2, keyPartInfo.part, keyPartInfo.index);
-          }
-        } else {
-          console.log(
-            "Secret session: wrong file order. Expected:",
-            result.expected,
-            "Got:",
-            result.got
-          );
-          sendSecretMessage(sock, 5, "Wrong file order. Session reset.", 0);
+        if (keyPartInfo && keyPartInfo.blocked) {
+          let message =
+            "ACK required for key part " +
+            keyPartInfo.expectedPartIndex +
+            " before continuing.";
+          console.log("Secret session failure:", message);
+          sendSecretMessage(sock, 5, message, 0);
           SecretSessionManager.endSession(sock);
+          return;
+        }
+
+        if (keyPartInfo) {
+          console.log(
+            "Sending key part",
+            keyPartInfo.index,
+            ":",
+            keyPartInfo.part
+          );
+          sendSecretMessage(sock, 2, keyPartInfo.part, keyPartInfo.index);
         }
       }
     });
@@ -165,16 +216,85 @@ function handleReset(sock) {
 }
 
 function handleAck(sock, fileName) {
-  let partIndex = parseInt(fileName) || 0;
+  let session = SecretSessionManager.getSession(sock);
+  if (!session) {
+    sendSecretMessage(
+      sock,
+      5,
+      "No active secret session. Send Secret (type 2) to begin.",
+      0
+    );
+    return;
+  }
+
+  if (!SecretSessionManager.isSessionValid(sock)) {
+    sendSecretMessage(
+      sock,
+      5,
+      "Secret session expired. Send Reset (type 5) and start again.",
+      0
+    );
+    return;
+  }
+
+  let partIndex = Number(fileName);
+  if (!Number.isInteger(partIndex) || partIndex < 0) {
+    sendSecretMessage(
+      sock,
+      5,
+      "Invalid ACK payload. Expected numeric key part index.",
+      0
+    );
+    SecretSessionManager.endSession(sock);
+    return;
+  }
+
   console.log("ACK received for key part:", partIndex);
 
-  SecretSessionManager.acknowledgeKeyPart(sock, partIndex);
+  let ackResult = SecretSessionManager.acknowledgeKeyPart(sock, partIndex);
+  if (!ackResult.valid) {
+    let message = "Invalid ACK. Secret session reset.";
+    if (ackResult.reason === "no key part pending") {
+      message =
+        "No key part is awaiting acknowledgment. Send Reset (type 5) and restart.";
+    } else if (ackResult.reason === "unexpected key part ack") {
+      message =
+        "Incorrect ACK index. Expected " +
+        ackResult.expectedPartIndex +
+        ". Send Reset (type 5) and restart.";
+    }
+
+    sendSecretMessage(sock, 5, message, 0);
+    SecretSessionManager.endSession(sock);
+    return;
+  }
 
   // Send ack receipt
   sendSecretMessage(sock, 3, "ACK received for part " + partIndex, 0);
 }
 
 function handleComplete(sock) {
+  let session = SecretSessionManager.getSession(sock);
+  if (!session) {
+    sendSecretMessage(
+      sock,
+      5,
+      "No active secret session. Send Secret (type 2) to begin.",
+      0
+    );
+    return;
+  }
+
+  if (!SecretSessionManager.isSessionValid(sock)) {
+    sendSecretMessage(
+      sock,
+      5,
+      "Secret session expired. Send Reset (type 5) and start again.",
+      0
+    );
+    return;
+  }
+
   if (!SecretSessionManager.isReadyForSecret(sock)) {
     console.log(
       "Client not ready for secret - missing files or acknowledgments"
